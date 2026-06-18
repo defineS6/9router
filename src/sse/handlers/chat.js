@@ -13,6 +13,15 @@ import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
+import {
+  isVisionBridgeModel,
+  hasOpenAIVisionInput,
+  buildVisionDescriptionBody,
+  rewriteBodyWithVisionDescription,
+  extractOpenAIText,
+  VISION_BRIDGE_TARGET_MODEL,
+  VISION_BRIDGE_VISION_MODEL,
+} from "open-sse/services/visionBridge.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
@@ -88,6 +97,11 @@ export async function handleChat(request, clientRawRequest = null) {
   const userAgent = request?.headers?.get("user-agent") || "";
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
   if (bypassResponse) return bypassResponse.response || bypassResponse;
+
+  // Vision bridge: use MiMo vision to describe images, then answer with DeepSeek text model.
+  if (isVisionBridgeModel(modelStr)) {
+    return handleVisionBridgeChat(body, clientRawRequest, request, apiKey);
+  }
 
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
@@ -269,4 +283,31 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     return result.response;
   }
+}
+
+async function handleVisionBridgeChat(body, clientRawRequest, request, apiKey) {
+  if (!hasOpenAIVisionInput(body)) {
+    log.info("VISION", `No image input, routing bridge directly to ${VISION_BRIDGE_TARGET_MODEL}`);
+    return handleSingleModelChat({ ...body, model: VISION_BRIDGE_TARGET_MODEL }, VISION_BRIDGE_TARGET_MODEL, clientRawRequest, request, apiKey);
+  }
+
+  log.info("VISION", `${VISION_BRIDGE_VISION_MODEL} → ${VISION_BRIDGE_TARGET_MODEL}`);
+  const visionBody = buildVisionDescriptionBody(body);
+  const visionResponse = await handleSingleModelChat(visionBody, VISION_BRIDGE_VISION_MODEL, clientRawRequest, request, apiKey);
+
+  if (!visionResponse.ok) {
+    log.warn("VISION", `Vision model failed: ${visionResponse.status}`);
+    return visionResponse;
+  }
+
+  let description = "";
+  try {
+    description = await extractOpenAIText(visionResponse);
+  } catch (error) {
+    log.warn("VISION", `Failed to parse vision response: ${error.message}`);
+    return errorResponse(HTTP_STATUS.BAD_GATEWAY, `Failed to parse vision response: ${error.message}`);
+  }
+
+  const rewrittenBody = rewriteBodyWithVisionDescription(body, description);
+  return handleSingleModelChat(rewrittenBody, VISION_BRIDGE_TARGET_MODEL, clientRawRequest, request, apiKey);
 }
